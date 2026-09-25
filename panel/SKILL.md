@@ -7,9 +7,9 @@ description: "Hand a task to whatever coding agent is running in another herdr p
 
 The implementer isn't a Task-tool subagent — it's whatever real coding-agent CLI process is running in a sibling terminal pane (codex, zcode, antigravity's `agy`, opencode, pi, omp, or anything else running under herdr), driven through `herdr`'s socket API (`herdr agent ...`). You submit a prompt into that pane, wait for the real agent to finish, and review its real working-tree changes.
 
-Same core loop as `task-exec`, plus **routing across more than one named agent pane**. If you have exactly one target, `task-exec` is the simpler skill — use it. Use this one when two or more of `codex-pane=`/`zcoder-pane=`/`agy-pane=` are available: it sends the task to whichever suits it better and puts the rest to work as concurrent read-only reviewers.
+The core loop is **submit → wait → review the real diff → loop fix rounds up to 3** — plus **routing across more than one named agent pane**. With exactly one target, skip routing and run the workflow against that pane. Use routing when two or more of `codex-pane=`/`zcoder-pane=`/`agy-pane=` are available: it sends the task to whichever suits it better and puts the rest to work as concurrent read-only reviewers.
 
-This skill is **agent-agnostic by design** — it targets a pane, not a specific tool. `herdr agent get <pane>` tells you what's actually running there; nothing in the workflow assumes codex or any other harness specifically. The only requirement is that herdr has a current state-tracking hook installed for that agent (`herdr integration status`) — without it, `herdr agent wait` can't reliably see idle/working/blocked transitions.
+This skill is **agent-agnostic by design** — it targets a pane, not a specific tool. `herdr agent get <pane>` tells you what's actually running there; nothing in the workflow assumes codex or any other harness specifically. Semantic waiting requires an active state-tracking hook — without it, `herdr agent wait` cannot reliably see idle/working/blocked transitions. Check `herdr agent get` and, where applicable, `herdr integration status`; use **Driving a pane with no herdr integration** when no hook is active.
 
 Review happens **in the current context, not a spawned subagent**. You (the session running this skill) already hold the task's scope and acceptance criteria — re-deriving that in a fresh subagent every round costs more than it saves, since the round-trip cost of a subagent is exactly re-establishing context you already have. Read the diff yourself with `git diff` / `git status` / `Read` and judge it directly.
 
@@ -81,89 +81,69 @@ so a wrong target is visible immediately rather than after the task has landed o
 ## Routing
 
 Only relevant when more than one candidate pane was given. Route on what the task's *failure mode*
-would be, not on which sounds fancier. These leanings come from observed runs, not vendor claims —
-revise them as evidence accumulates.
+would be, not on which sounds fancier. Treat the named pairings below as starting heuristics, not
+vendor guarantees or fixed model properties. Revise them from independently verified evidence in
+the current environment; do not import private run histories. For another agent kind, apply the
+same reasoning, say when you lack evidence, and prefer an idle candidate when no other factor decides.
 
-**Send to codex when a defect would be exploitable or silently corrupting:**
+**Prefer codex when a defect would be exploitable or silently corrupting:**
 
 - authorization and access control — who may do what, tenancy scoping, session and role checks
 - secrets handling, redaction, credential paths
 - concurrency, transactions, isolation levels, locking, retry semantics
-- infrastructure with footguns, where a misconfiguration fails silently or far from its cause
+- infrastructure where a misconfiguration fails silently or far from its cause
 - correctness-critical core logic that later work will sit on top of
 
-It has repeatedly defended boundaries nobody asked it to (validating an inbound header against log
-injection; rejecting a pooled endpoint where a direct one was required), and its self-reports have
-matched independent verification.
-
-**Send to zcode when the deliverable is fidelity to written sources:**
+**Prefer zcode when the deliverable is fidelity to written sources:**
 
 - deriving values, taxonomies, enums or contracts from specification documents
 - implementing a design or spec that already exists, against established conventions
 - conventions, tooling, CI, lint and gate work
 - anything where the docs might disagree with each other and someone must notice
 
-It reads authority documents closely, finds conflicts unprompted, and writes better test structure
-than the brief specifies — including tests that guard its own deliberate shortcuts, so a corner it
-cut cannot drift silently. It has diagnosed subtle build-configuration faults correctly (a CommonJS
-package that an ESM build could import types from but not runtime values) and surfaced them as
-decisions to hand back rather than working around them quietly.
-
-**Send to agy when the job is checking a claim against a source that already exists:**
+**Prefer agy when the job is checking a claim against a source that already exists:**
 
 - does this library actually support the option we configured, at the spelling we used?
 - does every item in this list have a test / a handler / an entry on the other side?
 - does each acceptance clause map to something that would fail if it broke?
 - can this specific assertion fail at all, given what it compares?
 
-Observed on an auth-library integration task: given the "tests that cannot fail" angle, it opened
-the vendored auth library's source and confirmed several configured options, a middleware's
-return-value contract, a migration's column names, and an audit-log signature — every one with a
-file:line citation, every one correct. That clean negative result is worth real money on a task
-whose protections fail *silently* if a key is misspelled. It also mapped every acceptance clause in
-the task to its tests and named the unmapped ones, and it alone spotted that a parity test compared
-unknown-vs-unknown and wrong-vs-wrong but never the two failure modes against each other.
+An external, enumerable oracle makes this angle concrete: require file:line citations for option
+names, return contracts and acceptance-to-test mappings. Source checking does not substitute for
+walking a user flow. Assign runtime interaction review separately rather than treating an accurate
+contract checklist as proof that a screen is usable.
 
-Its weakness is the complement: **it does not simulate a user.** On that same run it declared "P1
-findings: none — the production behavior is functional" while a P1 sat in a file inside its scope —
-a submit button that stayed disabled forever after one wrong password. It found a *P3* in that very
-file. So agy is strong where the oracle is external and enumerable, and weak where you have to walk
-a flow in your head and ask "and then what happens to the person?". Do not give it "is this screen
-usable"; do give it "is every one of these twelve paths actually tested".
+**Distinguish deciding a boundary from touching one.** Reserve the correctness/security preference
+for work that *decides* a security question; application code that merely consumes an established
+boundary is fair game for either implementer, with the same verification requirements.
 
-**A softened earlier rule.** "Security-sensitive work always goes to codex" was too broad. zcode has
-written a careful client against a trust boundary unprompted — forcing `credentials` after the
-caller's spread so it cannot be widened, and dropping a caught network error precisely because the
-thrown value can carry URLs. Reserve codex for work that *decides* a security question;
-application code that merely touches a boundary is fair game for either.
-
-**Brief quality is a routing input.** zcode's best runs follow briefs that state scope, constraints
-and acceptance concretely and leave little ambiguity; there is less evidence about its judgment
-under a vague brief. If the task cannot be specified tightly and will need interpretation, that
-weighs toward codex — or toward tightening the brief first.
+**Brief quality is a routing input.** Specification-oriented work needs concrete scope, constraints
+and acceptance criteria. If the task cannot be specified tightly and needs interpretation, prefer
+a candidate with verified judgment on ambiguous work — or tighten the brief before routing it.
 
 **Overlap is fine.** When a task is genuinely both, prefer codex if a defect would be exploitable or
 silently corrupting, zcode if it would be a wrong value faithfully implemented. When neither fits,
-say so and pick the idle one.
+say so and pick an idle candidate. **Never route on task size**: a one-line authorization change
+still has a correctness-critical failure mode.
 
-**Never route on task size.** A one-line change to an authorization check still goes to codex.
+**What decides your verification burden** is whether an agent's report matches reality. Verify
+regardless, but use reproducible evidence to decide where to look more closely. Split that judgment
+by role: an implementer's self-assessment and a reviewer's independently checkable citations are
+different evidence. A weak self-report does not automatically invalidate a useful review finding.
 
-**What actually decides your verification burden** is whether an agent's report matches reality.
-codex and zcode self-reports have held up under independent checking; one agy run reported thorough
-verification alongside a bug that 500'd every route its two tested URLs did not touch. Verify
-regardless (see Guardrails), but weight where you look.
+**Severity calibration belongs in the brief.** Tell every reviewer to be conservative: a test
+thinner than its name is generally a test-quality finding, not automatically a production blocker.
+Ask for the user-visible consequence and re-derive severity rather than inheriting the label.
 
-**Split that judgment by role, though — agy's reliability is not one number.** As an *implementer*
-self-reporting on its own work it has overclaimed. As a *reviewer*, on the auth-library task above,
-every finding it filed was accurate on inspection, because a reviewer's output is a set of citations
-you can open rather than a claim about work it has already done. Reserve the distrust for its
-self-assessment, not for its reading of someone else's code.
+**Cautions for every pane, including opencode:**
 
-**Severity calibration follows the brief, for agy specifically.** On one task its severities ran hot
-(two test-quality issues filed P1). On another, the brief said "be conservative about severity; a
-test thinner than its name is P2, not P1" — and it filed no P1s at all and graded accurately. One
-sentence in the brief fixed a trait previously recorded as a fixed property of the agent. Say it
-explicitly every time rather than discounting afterwards.
+- **A self-reported clean gate still needs a clean-state re-run.** If it cannot be reproduced,
+  require investigation of the discrepancy rather than another assertion that it passed.
+- **A scope decision is to be reported, not built.** An unrequested migration or shared-invariant
+  exception needs the user's approval, even if it would make a test easier to write.
+- **Budget for cost and latency.** Agree any task-specific limits with the user, brief tightly,
+  and consolidate findings rather than dispatching redundant rounds. Read the permission-dialog
+  guidance under **Guardrails** before driving an opencode pane.
 
 ## Tool requirements
 
@@ -173,423 +153,526 @@ explicitly every time rather than discounting afterwards.
 
 ## Guardrails
 
-- The target pane's agent is the **only writer** to the working tree during rounds 1–3. Do not Edit/Write files yourself until round 3's fix has been requested and still fails review.
-- **One writer per working tree, always.** Never run two implementer panes against the same
-  checkout — they delete each other's build output and each inherits failures caused by the other's
-  half-finished work, which you then debug as if they were real. Give the second lane its own git
-  worktree. *Read-only reviewer* panes are the exception and are safe to run concurrently — with
-  each other and with the implementer — but only for reading. See the next bullet.
-- **Reviewers may read; they must not build.** "Read-only" is an instruction to the agent, not an
-  enforced property, and a reviewer asked to verify something naturally reaches for the project's
-  gate. Build, typecheck and format-write commands write to the shared tree (in a TS monorepo:
-  `pnpm check`, `pnpm build`, `pnpm typecheck` — `tsc -b` writes `dist`, `dist-types` and every
-  `*.tsbuildinfo` — and `prettier --write`). Two reviewers running those against one checkout
-  clobber each other's incremental cache and produce *false* failures, which is worse than not
-  running the check at all: you debug a phantom. Tell every reviewer explicitly which commands are
-  off-limits. Reading, linters and formatters in `--check` mode, and test runners are safe (a test
-  harness that creates its own uniquely-named database per run does not collide). **You** run the
-  authoritative clean-state gate alone, after the reviewers have reported — not while they work.
-- **"Alone" includes the implementer, and includes the round you are about to dispatch.** The
-  concurrency rule is easy to apply to reviewers and then break yourself. Observed here: the
-  driving context started a full lint+test gate, then dispatched a round-3 fix into the same
-  checkout seconds later. The implementer renamed a selector and edited a template while jest was
-  running; the output came back interleaved and truncated, with lint output cut mid-path straight
-  into the test log, and had to be thrown away. Sequence it: implementer idle → gate → read result
-  → dispatch next round. Never overlap a gate with a pending or in-flight fix round, and re-run the
-  gate after the last write lands, not before.
-- Review is read-only: use `git diff` / `git status` / `Read` to judge the change. Don't Edit/Write during a review step, even to "just fix the small thing" — that belongs in the next round's fix instruction, or to Step 3's manual-fix fallback after round 3.
-- Before submitting, confirm the target with `herdr agent get <pane>`. Note which `agent` it reports. If `agent_status` is not `idle`, stop and ask the user before interrupting whatever it's already doing.
-- If `herdr integration status` shows the pane's agent as **not installed** or **outdated**, warn the user before relying on `--wait`/state detection — offer to run `herdr integration install <name>` first (a local config change; confirm before running). **Exception: zcode does not appear in `herdr integration status` at all** even though it has a working hook; check `herdr agent get` for it instead, and do not offer to install anything on the strength of that absence. An `outdated` row is also not automatically a problem — codex has run `outdated` here while reporting idle/working/blocked correctly; treat it as a reason to corroborate with a completion token, not to stop.
-- Confirm the pane's `cwd` matches the repo/worktree you expect. A mismatched `cwd` means the task would land in the wrong place — ask before proceeding if it doesn't match.
-- Never put secrets, `.env` contents, or credentials into the prompt text sent to the pane.
-- Max **3 review rounds**. Don't keep looping on optional polish — only loop on concrete, meaningful issues.
-- If a review finding requires a product/scope decision (not a straightforward bug), stop and ask the user regardless of round count.
-- Quote the prompt text carefully when building the `herdr` shell command (it may contain quotes, backticks, or newlines) — prefer a single-quoted string with `'\''` escaping, or write it to a temp file and pass `"$(cat file)"`, over naive double-quoting.
-- **A long brief goes in a file, not down the wire.** Write it to the scratchpad and send one line telling the agent to read that path. Multi-line text sent into a TUI can submit early on the first newline.
-- **Verify the agent's claims yourself; never accept its report as the verdict.** Re-run the acceptance checks from a clean state. An agent's confident summary and a broken build coexist comfortably — one run here shipped a report of thorough curl verification alongside a bug that 500'd every route its two tested URLs didn't touch.
+- The target pane's agent is the **only implementation writer** during rounds 1–3. Do not edit
+  implementation files yourself until round 3's fix has been requested and still fails review.
+  Briefs and review records are coordination artifacts, not permission to change the implementation.
+- **One writer per working tree, always.** Never run two implementers against one checkout.
+  Half-finished edits and clobbered build output create misleading failures. A second implementation
+  lane needs its own worktree. Reviewers may read concurrently with each other, but review a frozen
+  version: ownership stays with the implementer while writes pause for review.
+- **Reviewers may read; they must not build.** State the off-limits commands explicitly. Builds,
+  incremental typechecks and format-write commands can write generated output or caches; for
+  example, `tsc -b` writes build output and `*.tsbuildinfo`. Do not assume a command is read-only
+  because it is called a check or a test. Permit check-mode linters, formatters or tests only after
+  confirming they do not modify the shared tree or collide on external resources. Unique test
+  databases alone do not establish that all outputs are isolated. **You** run the authoritative
+  clean-state gate alone after the reviewers have reported.
+- **"Alone" includes the implementer and the next fix round.** Sequence it: implementer idle →
+  reviewers complete → gate → read result → dispatch next round. Never overlap a gate with an
+  in-flight fix, and re-run it after the last write, not before.
+
+  **"Alone" excludes your own second job too.** Never have two gate/build jobs in flight against
+  one checkout, or clean output while a preceding job may still use it. Do not sequence pipelines
+  with a process-presence loop: short-lived build stages have gaps between them. Wait for the
+  actual job's completion notification and exit status.
+
+  **"Alone" excludes your edits while reviewers read.** Before any write, confirm **every**
+  reviewer emitted its dispatch-specific completion token, not just one reviewer or an idle pane.
+  Otherwise a verdict may cover mixed file versions. If an urgent change cannot wait, pause review,
+  identify the changed files to every affected reviewer, and re-review the changed state; earlier
+  findings on those lines are unverified.
+- **Never pipe the gate through `tail`, `head` or `grep`.** A successful final pipeline command can
+  hide a failing gate, and truncated logs lose counts and diagnostics. Capture the full output and
+  gate status before reading selectively. For a repository whose documented gate is `pnpm check`:
+  `pnpm check > "$LOG" 2>&1; gate_rc=$?; printf 'exit=%s\n' "$gate_rc"; exit "$gate_rc"`.
+  Run this in the gate's dedicated shell job with a unique log path, not in an interactive shell
+  you need to keep open. Use the actual repository gate, not this example blindly.
+- **Exit code 127 is an execution problem, not a test verdict.** It commonly means command not
+  found. In zsh, a scalar containing a command plus arguments is not automatically word-split;
+  write the command explicitly or use a function/array. A gate may have run partially before a
+  missing subcommand, but it did not complete successfully. Fix the invocation and re-run; 127
+  never establishes that a mutation was caught by its intended assertion.
+- Review is read-only: use `git diff` / `git status` / `Read`. Even a small fix belongs in the next
+  instruction or the manual finish after round 3, not silently inside a review step.
+- Before submitting, confirm `agent`, `agent_status` and `cwd` with `herdr agent get <pane>`.
+  If the agent is not idle, ask before interrupting. A mismatched directory also needs confirmation.
+- If integration status is **not installed** or **outdated**, warn before relying on state tracking.
+  Offer `herdr integration install <name>` only with the user's confirmation of that local config
+  change. Zcode can have an active custom hook without appearing in `herdr integration status`;
+  check `herdr agent get` instead of treating absence as failure. An outdated row calls for
+  corroborating state with the completion token, not an automatic assumption that the hook is broken.
+- Never send secrets, `.env` contents or credentials in a pane prompt or brief.
+- Do not stage, commit or push unless explicitly requested. Preserve unrelated working-tree changes.
+- Max **3 review rounds per finding cycle**. Loop only for concrete, meaningful issues, not polish.
+  Product or scope decisions always go back to the user, regardless of round count.
+- **Driving opencode: expect in-app permission dialogs separate from herdr state tracking.**
+  With an active hook, drive it through the normal semantic commands. Its access controls may
+  prompt for external paths, including an external brief or build scratch directory. Such requests
+  can recur across paths and rounds; a routine-looking request is still a permission decision.
+  - Read `herdr agent read <pane> --lines 200 --source visible` to inspect the actual dialog when
+    the default source refuses a blocked read. Expand the capture if the request is not visible.
+  - **Ask the human unless the exact operation and scope are explicitly preauthorized.** Reading
+    a brief is not authorization for writes, cleanup, secrets or unrelated paths. Inspect the
+    requested action, path and available choices each time. If preauthorized, select the narrowest
+    matching option only after verifying its label and focus; never blindly send Enter or assume
+    that "Allow once" is the default. If focus or scope is unclear, ask the human to handle it.
+  - Do not disable permissions, broaden sandbox rules or use an alternative command to bypass a
+    blocked request. For a new brief, use an already permitted, repository-approved scratch
+    location where possible. Do not relocate a blocked operation to evade its approval boundary.
+    Keep scratch files out of commits and remove only artifacts created for this task after
+    acceptance; never recursively remove an existing directory of unknown ownership.
+- Quote prompt text carefully: it may contain quotes, backticks or newlines. Prefer single-quote
+  escaping or the harness's safe argument handling over naive shell interpolation.
+- **A long brief goes in a file, not down the wire.** Use read/write tools for the file, then send
+  a single-line instruction with its safely quoted path. Multiline TUI input can submit prematurely.
+  Prepare coordination files before review begins; do not use them to violate the tree freeze.
+- **Verify claims yourself; never accept the agent's report as the verdict.** Apply the
+  **Verification contract** even when the report is confident and detailed.
 
 ## Driving a pane with no herdr integration
 
-**zcode no longer needs this path.** As of 10 September 2026 it has a state-tracking hook: `herdr agent get` reports `agent":"zcode"` with a real `agent_status`, it appears in `herdr agent list`, and `herdr agent prompt` / `herdr agent wait --until idle --until working --until blocked` drive it exactly like codex and agy. Its state mapping: new/cleared/compacted session and end-of-turn → `idle`; prompt submitted, tool invoked, tool completed *or failed* → `working`; permission request → `blocked`.
+**Use zcode's hook when it is active.** With the state-tracking integration enabled,
+`herdr agent get` reports `agent: zcode` with a real `agent_status`, and the pane appears in
+`herdr agent list`. Drive it with `herdr agent prompt` / `herdr agent wait` like other hooked agents.
+Its state mapping is: new/cleared/compacted session and end-of-turn → `idle`; prompt submitted,
+tool invoked, tool completed *or failed* → `working`; permission request → `blocked`.
 
-Three zcode caveats that do **not** go away, and that shape how you use it:
+Zcode integration caveats:
 
-- It is **absent from `herdr integration status`** (no native process detection). Do not read that command's silence as "not installed" for a zcode pane — `herdr agent get` is the authority.
-- There is **no guaranteed release event when the process exits**, and sessions are **not restored after a herdr server restart**. So `--until idle` cannot perfectly distinguish "finished this turn" from "the process died". Keep asking for a completion token as the last line and treat `idle` **plus** the token as the real signal; re-check the pane after any herdr restart.
-- Model, token, quota and task metadata are not reported for zcode, so its rows carry none of the `tokens` fields the other agents show.
+- It may be **absent from `herdr integration status`** because it is not natively detected. Do not
+  treat that absence as proof the hook is missing; check `herdr agent get`.
+- There is **no guaranteed release event when the process exits**, and sessions are **not restored
+  after a herdr server restart**. `idle` alone cannot distinguish completion from a dead process.
+  Require `idle` plus the current completion token, and re-check the pane after a server restart.
+- **Registration can disappear; check immediately before each dispatch, not only at Step 0.**
+  If `herdr agent prompt` returns `agent_not_ready: not an active named agent`, read the pane with
+  `herdr pane read` before assuming the process died. If it is still alive, idle, and has not
+  accepted the prompt, fall back to `herdr pane run` plus an anchored completion-token wait.
+  Do not duplicate a dispatch that may already have landed.
+- Model, token, quota and task metadata may be unavailable; do not infer them from absent fields.
 
-Use the path below for any agent that still has no hook. Such an agent reports `agent_status: unknown`, may not appear in `herdr agent list` at all, and cannot be driven by `herdr agent prompt` / `herdr agent wait`. Find it with `herdr pane list` instead:
+Use the path below for an agent without an active hook. It may report `agent_status: unknown`,
+may not appear in `herdr agent list`, and cannot reliably use semantic prompt/wait commands.
+Find it with `herdr pane list`, validate its identity and working directory, and confirm it is ready:
 
 1. Send with `herdr pane run <pane> "<one line>"` (sends the text plus Enter).
-2. Ask the agent, in the brief, to print a unique completion token as the **last line, alone on its own line**.
-3. Wait with an **anchored regex**, backgrounded:
+2. Ask the agent in the brief to print a unique completion token as the **last line, alone on its
+   own line**, only after completing the requested work and evidence report.
+3. Wait with an **anchored regex**, backgrounded when the harness supports it:
    `herdr pane wait-output <pane> --regex '(?m)^\s*TOKEN\s*$' --source recent-unwrapped --timeout <ms>`
 
-Anchoring is not optional. A bare `--match TOKEN` fires on the agent echoing its own plan back into the pane ("12. Report; print TOKEN"), reporting completion while the work has not started. If a wait returns and the working tree is unchanged, suspect exactly this before believing the agent did nothing.
+Anchoring is not optional. A bare `--match TOKEN` can match an echoed plan mentioning the token
+before work starts. If a wait returns and the working tree is unchanged, investigate before
+concluding that the agent did nothing. An echoed brief is not completion evidence.
+
+**Anchoring is also not sufficient: make every token unique per dispatch.** Scrollback still
+contains previous rounds' tokens. Reusing `REVIEW_DONE` can make the next wait return immediately
+while the reviewer is still reading. Include task, round, pane and a fresh suffix — for example,
+`TASK_R2_P4_DONE_<nonce>` — and never reuse a token inside the session. If one was reused, require
+an increase over the previously recorded count of standalone matches and corroborate the current
+report; if that baseline is unknown, obtain a fresh completion acknowledgement instead.
 
 Everything else — review, rounds, guardrails — is unchanged.
 
-**Do not poll a pane's screen to track progress when the agent has a hook.** `herdr agent wait` is the mechanism; repeated `herdr agent read` in a loop burns turns and reads a truncated window, so a permission prompt below the fold looks like "no prompt" and the loop spins. Wait on the state, then read the pane **once** when the wait returns — and if it returns `blocked`, read enough lines to actually see the prompt before deciding.
+**Do not poll a pane's screen to track progress when the agent has a hook.** Use `herdr agent wait`.
+Repeated screen reads waste turns and can miss a permission prompt outside the captured window.
+Read once when the wait returns; for `blocked`, use the visible source and enough lines to see the
+actual request. A hookless timeout is a reason to inspect, not a reason to assume completion.
 
 ## Verification contract
 
-An agent's report is a claim, not a verdict. Two halves make it cheap to check: demand evidence in
-the brief, then check the evidence rather than the prose.
+An agent's report is a claim, not a verdict. Demand evidence in the brief, then check the evidence
+rather than the prose.
 
 **In the brief (Step 1), require the agent to return:**
 
 - the actual values it observed for anything it filters, matches or parses on — read from the real
   source, not assumed from a name;
-- raw output of the full gate, not a summary of it;
-- an explicit list of what it removed, renamed, worked around, or deliberately left undone.
+- raw output of the full gate and its exit status, not just a summary;
+- an explicit list of what it removed, renamed, worked around, or deliberately left undone;
+- a self-audit against the governing documents and acceptance criteria, followed by the unique
+  completion token for this dispatch.
 
 **Before accepting (Step 2), verify independently — never from the diff alone:**
 
-- re-run the full gate yourself **from a clean state**; delete build output and incremental caches
-  first, because a stale `tsbuildinfo` produces false failures *and* false passes;
-- for any claim about an interface it consumed, open the other side and confirm the shape matches;
-- for new tests, **break the code they guard and confirm they fail.** A passing test proves nothing
-  about whether it would catch a regression, and this is the check most often skipped;
-- confirm existing tests were not *weakened* — assertions loosened, cases deleted, globs narrowed
-  so new code escapes an existing sweep — rather than only that the suite is green;
-- **confirm the gate actually covers the new code.** A green gate is evidence only about what it
-  compiles and runs. Read the `include`/`exclude` globs of the typecheck projects and the test
-  runner's project globs before believing a pass. Observed here: a repo's `tsconfig.json` used
-  `include: ["src/**/*"]`, so no test file had ever been typechecked — type errors sat invisible in
-  the test suite of every previously "green" task, and the new work inherited that blind spot.
-- **Ask what the test harness silences, not just what it runs.** Globs are one blind spot; the
-  harness's own leniency settings are a worse one, because they make a whole *class* of defect
-  unfailable. Observed here, in a component-framework repo: specs used a permissive schema that
-  suppresses unknown-element errors, and the test runner mapped a shared UI package to an empty
-  module. The implementer added a new dialog element to a template for a component that had **no
-  selector at all** — it had only ever been instantiated dynamically. The element matched nothing,
-  the schema swallowed the error, the modal never rendered, and the view reference for it stayed
-  undefined so the call site threw. Every suite stayed green through two agent self-reports and
-  one reviewer pass. Equivalents to look for: permissive/no-errors DOM schemas, shallow rendering,
-  module mocks that stub the very thing under test, `--passWithNoTests`, and any module-name mapper
-  pointing at an empty stub. When you find one, say explicitly which acceptance criteria it cannot
-  verify, and route those to a runtime or e2e check instead.
+- Re-run the full gate yourself **from a clean state**, after all reviewers have finished and the
+  implementer is idle. Use the repository's documented clean procedure for generated outputs and
+  incremental caches; stale caches can produce false failures *and* false passes. Do not delete
+  user work or unknown paths to obtain a clean state.
+- For any claim about an interface it consumed, open the other side and confirm the shape matches.
+- For new tests, **break the behavior they guard and confirm they fail for the expected reason**.
+  Use an isolated disposable worktree or ask the sole implementer to run the probe, preserving
+  the one-writer rule. Do not mutate the shared tree during review. Restore mutations, verify the
+  restoration, and run the gate on the final unmutated state. A passing test alone does not prove
+  that it would catch a regression; a command-launch failure is not a successful mutation probe.
+- Confirm existing tests were not *weakened*: assertions loosened, cases deleted, or globs narrowed
+  so new code escapes an existing sweep. A green suite alone does not establish this.
+- **Confirm the gate actually covers the new code.** Read typecheck `include`/`exclude` settings
+  and test-runner project globs. A source-only include can leave test files entirely untypechecked.
+  State coverage gaps rather than calling an uncovered file verified.
+- **Ask what the harness silences, not just what it runs.** Check permissive/no-errors DOM schemas,
+  shallow rendering, mocks that replace the thing under test, `--passWithNoTests`, and module-name
+  mappers pointing to empty stubs. These can hide whole classes of failures. Name the acceptance
+  criteria they cannot verify and route those to runtime or end-to-end checks instead.
+- **Visibility gated by role or permission gets a runtime check with one allowed and one denied
+  identity.** Structural directives, guards and feature flags can be silently omitted by a lenient
+  harness. A test of the permission list does not prove the element renders correctly. Name both
+  test identities in the acceptance criteria without exposing credentials, and check both in the
+  running app. The allow and deny cases are separate behaviors; one says nothing about the other.
+- **A fake used by a contract suite needs its own review.** A shared suite against a real backend
+  and a fake is only as honest as the fake's model of the provider. Ask which documented behaviors
+  it models and whether the suite would fail if the adapter stopped supplying required inputs.
+  For a generic example, a fake that always rejects duplicates cannot verify that the caller sends
+  the condition the real provider requires to prevent replacement. Give fake fidelity its own
+  review question; do not let it disappear into the category of test scaffolding.
 
-**Verify a finding against a clean baseline, never against the current tree.** When you downgrade a
-reviewer's finding to "unproven — confirm at runtime", the confirmation must compare against `HEAD`
-(or a stash), because by the time you look, someone may already have fixed it — and a fixed tree
-and a never-broken tree are indistinguishable from the outside. Observed here: a reviewer reported
-that portalling a modal out of its overlay container would push other floating panels behind it.
-The driving context correctly regraded it to "unproven" (the reviewer's stacking argument was
-incomplete) and sent it for a runtime check. The check came back showing the overlay container at a
-very high explicit stacking value, which was read as evidence the concern had always been baseless
-— and reported to the owner as a non-issue. It was not: the implementer had *added* that stacking
-override as a global change during the browser session, after the owner spotted the bug. The finding was real, the
-regrade was right as process, and the conclusion was still wrong. Two habits prevent it: state
-explicitly what the baseline value *was* before accepting a runtime observation, and treat
-"unproven" as an open item with an owner, never as a soft dismissal.
+**Verify a finding against the relevant pre-fix baseline, not only the current tree.** A runtime
+check against code already repaired cannot distinguish a real defect from a false report. Record
+what the baseline value was and compare the relevant versions. Use `HEAD` only if it really is the
+reported version; otherwise preserve a pre-fix snapshot without disturbing unrelated work.
+Treat "unproven — confirm at runtime" as an open item with an owner, never as a soft dismissal.
 
-**Check the values, not only the shape.** This is the check that survives everything above. A
-review can confirm the structure is right — tables, constraints, wiring, tests that fail when
-mutated — while every derived *value* in it diverges from what the specification says. Those look
-identical from a diff and identical from a gate. For anything the documents define, name the
-document line that fixes the value and check the produced value against it. Ask it as its own
-question, separately from "is the structure right", because a reviewer given only the structural
-frame will answer only the structural question.
+**Enumerate in both polarities, not just exhaustively.** A suite can enumerate every catalog item
+and still exercise only denials. A fail-closed implementation can incorrectly reject legitimate
+operations while every denial test passes. For each entry, ask whether a case passes only when
+access is correctly *granted*, as well as whether forbidden access is denied. Exhaustive names
+are not exhaustive outcomes.
 
-**A disclosed simplification is not an approved one.** Agents that report honestly will tell you
-what they simplified — and that disclosure reads as diligence, so it tends to be accepted on sight
-and then verified only for *accuracy* ("is it true that this is simplified?") rather than for
-*consequence*. Ask the second question every time: does this simplification defeat the purpose the
-task exists for? Observed here: an agent correctly disclosed that a fixture's hash projection was
-"fixture data, not the production computation", a cross-agent review confirmed the disclosure held,
-and both missed that the omitted fields made the fixture unusable for the one scenario it was built
-to provide.
+**Reconcile the test count across rounds.** Compare reported counts with raw output and explain
+changes. A decrease may reflect consolidation into an enumerating test or an accidentally deleted
+case. An unchanged count may be legitimate when assertions were added to existing tests. Check
+what changed and whether it fails under a relevant mutation; do not assume every behavior change
+must increase the number of tests.
 
-An agent that flags a gap it could not close is doing the right thing; one that reports success on
-a claim you cannot reproduce is not. Send the second kind back naming the specific gap.
+**Check the values, not only the shape.** Tables, constraints, wiring and mutation-sensitive tests
+can all be structurally sound while derived values diverge from the specification. For each value
+defined by a document, identify the document line that fixes it and compare the produced value.
+Ask this separately from structural correctness or a reviewer may answer only the latter.
+
+**A disclosed simplification is not an approved one.** Verify its consequence, not just whether
+the description is accurate. Does the simplification defeat the purpose of the task or remove
+information needed by an acceptance scenario? If so, disclosure does not authorize it; ask the user.
+
+An agent that flags a gap it could not close is doing the right thing. A success claim you cannot
+reproduce must go back with the specific discrepancy, not be accepted on confidence alone.
 
 ## Cross-agent review: the implementer never reviews itself
 
-On work that matters — anything governed by a specification, anything where a defect is expensive
-or silent — the implementer's own report is one input, your review is a second, and **the other
-agent's review is a third**. Use all three. Whoever implemented does not review.
+On specification-governed or expensive-to-get-wrong work, the implementer's report is one input,
+your review is another, and independent reviewers supply additional evidence. An implementer's
+self-audit does not count as the independent review of that same change.
+
+For a user-supplied three-pane set, the default fan-out is:
 
 - codex implemented → **zcode and agy review**, you review.
 - zcode implemented → **codex and agy review**, you review.
 - agy implemented → **codex and zcode review**, you review.
 
-**Use both non-implementing panes, not one.** A third independent reader is worth the dispatch: an
-observed run here had the driving context's own review and a green clean gate find nothing, after
-which a single cross-agent pass found three P2 defects and its re-review of the fixes found three
-more. That is not one agent being special — it is that a review conducted against your own
-understanding reproduces your own blind spots, and each additional reader has a real chance at a
-different class of defect. Run them concurrently; they are read-only, so they do not collide (per
-the build rule in Guardrails).
+Apply the same rule to other named agents. **Use both non-implementing panes when both were
+provided**, not just one. Independent readers can catch different blind spots even after your
+own review and a clean gate. With fewer panes, use the available non-implementers; with only one
+target, review in the current context and disclose the missing cross-agent coverage. Propose extra
+panes to the user rather than silently recruiting them. Run reviewers concurrently on a frozen
+working tree, never concurrently with implementation writes or builds.
 
-**Give them different angles, not the same brief.** Identical briefs produce heavily overlapping
-findings and double your verification load for little new coverage. Split by the agent's observed
-strength: give **zcode** specification fidelity — **both** halves of it, since they are different
-questions: what the documents require that nothing implements *and* nothing discloses (omission),
-and whether the values the code actually produces match what the documents define (divergence).
-Give **codex** the adversarial pass — tenancy, authorization, concurrency, trust boundaries, what
-breaks. Give **agy** the third angle the task suggests (dead code and prior-spec leftovers,
-interface claims checked against the other side, tests that cannot fail). Every brief still carries
-the read-only rule, the already-reported items, and the report-conflicts-don't-resolve-them rule.
-Evidence that the *split* is what pays, not the headcount: on one interface task every reader
-returned a **disjoint** defect class. zcode alone found a required event shape the interface could
-not express — its brief asked what the documents require that nothing implements. agy alone found
-a tautological assertion comparing two freshly generated UUIDs — its brief asked which tests cannot
-fail. The driving context alone found a disclosed simplification that destroyed evidence — it asked
-what a simplification *costs*. Nothing overlapped. A third reader handed the same brief would
-mostly have duplicated one of the others, so spend the dispatch on a new question, not a new pane.
+**Give them different angles, not the same brief.** Identical briefs duplicate findings without
+adding much coverage. Default angles:
 
-**Name the divergence half explicitly or nobody runs it.** Reviewers answer the question you asked.
-In an observed five-round run, three review passes — the implementer's self-audit, a cross-agent
-review, and the driving context's own — all examined structure, because structure was what the
-briefs described; the only P1 defects were content diverging from the specification, and the owner
-found all of them. Cite the governing sections in the brief and ask, for each derived value, which
-line fixes it and whether the code matches.
+- **zcode — specification fidelity, in both directions:** what documents require that nothing
+  implements *and* nothing discloses (omission), and whether produced values match the documents
+  (divergence).
+- **codex — correctness and boundary review:** authorization, tenancy, concurrency, trust boundaries,
+  and failure paths within the authorized task scope.
+- **agy — source-backed claim checking:** dead code and prior-spec leftovers, interface claims
+  checked against the other side, and tests whose assertions cannot fail.
 
-**Merge before acting.** De-duplicate the reviewers' findings, verify each one yourself, then send
-**one** consolidated fix round to the implementer. Never dispatch two fix rounds from two reviews —
-that puts two sets of instructions against one tree, and the implementer cannot tell which to
-believe when they overlap.
+Every brief still carries the read-only rule, already-reported findings, and the instruction to
+report document conflicts rather than resolve them. Spend an additional dispatch on a new question,
+not just another reader answering the same question.
 
-**Verify severity, not just existence.** Reviewers inflate it, and an inflated grade survives the
-merge unless you re-derive it yourself. Observed on the same task: a reviewer filed two P1s that
-were really P2s — the implementer's own mutation probes had already turned both of those tests red,
-so they caught the obvious break and missed a subtler one. That is *thinner than its name claims*,
-not *blocks*. The findings were real and worth fixing; the ranking was not, and the driving context
-passed the inflation straight through to the owner. Ask of each finding: is this a shipped defect,
-or a test weaker than its name? Rank by what reaches production, and say plainly when you regrade a
-reviewer — an inflated P1 spends the owner's attention on the wrong item.
+**Assign the angle to the brief, not the agent.** The pairings are defaults, not inherent expertise.
+When reviewers disagree, settle the finding with source evidence, a runtime check or an isolated
+mutation probe rather than the reputation of the supposed specialist. Agreement is still multiple
+claims, not independent confirmation of the behavior. The value is independent reasoning.
 
-**Weight reports by track record, but use noisy reviewers anyway.** An agent whose self-reports have
-been unreliable is disqualifying as an *implementer* and much less so as a *reviewer*: a reviewer's
-output is a set of claims you verify before acting on, so its failure mode degrades to wasted
-verification time rather than shipped defects. Use it; do not trust its self-assessment. This is why
-agy earns a reviewer slot despite the implementer-side evidence in **Routing**.
+**Name the divergence half explicitly.** Cite the governing sections and ask which source line
+fixes each derived value and whether the code matches it. A structural review alone will not
+re-derive content from the specification.
 
-**The reviewer is read-only.** State it three ways in the brief: do not edit, do not create, do not
-stage or commit; findings in the reply only. This is not politeness — a reviewer that writes turns
-into a second writer in one working tree, and two writers produce phantom failures each blames on
-the other. A read-only reviewer can safely run while the implementer still owns the tree.
+**Open the cited line before a finding becomes an instruction.** A file:line citation is itself a
+claim. Verify that the line actually says what the reviewer reports, not merely that code and some
+expectation differ. Quote the governing line in the fix brief. Otherwise an implementer can change
+both code and its oracle to satisfy a misread requirement while the tests stay green.
 
-**Brief the reviewer from the requirements, not from your findings.** This is the whole point. A
-review conducted against your brief reproduces your brief's blind spots; the defects that survive
-round after round are precisely the ones no brief mentioned. So hand the reviewer the authority
-documents, the acceptance criteria and the invariants, and ask what nothing implements *and*
-nothing records as deferred. That category — neither built nor disclosed — is where the expensive
-findings live.
+**"This is unreachable" is path-sensitive.** Removing a guard branch is not necessarily removing
+dead code. Trace every input and caller, including paths not examined by the reviewer, and check
+what the fallback does. A branch redundant on one operation may still handle a valid input on
+another. Prefer a test establishing unreachability over deletion based on a partial trace.
 
-Do give it the list of already-found items, with instructions not to re-report them but to say so
-if one does not actually hold. That converts prior findings into a verification target instead of
-noise.
+**Merge before acting.** Wait for every reviewer, de-duplicate their findings, verify each yourself,
+and send **one** consolidated fix instruction. Separate simultaneous fix briefs can conflict and
+leave the implementer guessing which instruction governs.
 
-Tell the reviewer to **report conflicts, not resolve them**. A reviewer that quietly picks the
-easier reading of two disagreeing documents launders a design decision into an implementation
-detail.
+**Verify severity, not just existence.** Is this a shipped defect or a test weaker than its name?
+Rank by plausible production consequences and evidence, not the reviewer's label. A test that
+catches an obvious break but misses a subtler mutation deserves improvement, not an automatic
+blocker rating. State plainly when you regrade a finding and why.
 
-**Two angles worth adding to every brief, because reviewers reliably miss both.** Both were missed
-by two independent reviewers here and surfaced only from the driving context's own checking:
+**Weight reports by verified evidence, separately by role.** A reviewer supplies claims you can
+inspect, so a noisy reviewer may still add value even when you would not rely on its implementation
+self-assessment. Verify the claims instead of trusting or dismissing the entire report.
 
-- **Newly-added suppressions, and whether their justification is true.** Any `eslint-disable`,
-  `@ts-ignore`, `@ts-expect-error`, `.skip`, `xit`, or lint-config exemption the diff introduces.
-  Ask not only whether it is warranted but whether its stated reason is *factually accurate*.
-  Observed here: an implementer set a component selector that violated the lib's mandatory prefix
-  rule and suppressed the rule with the comment "this selector is part of the existing template
-  contract" — the template line in question was one the same agent had written a round earlier. A
-  self-created constraint used to justify silencing a rule is a reliable tell, and the resulting
-  exemption outlives the ticket.
-- **Blast radius versus stated scope.** Flag any change whose reach exceeds the task, especially
-  global styles, shared config, base classes and DI providers — even when it is a correct fix.
-  Observed here: a local dropdown-stacking bug was fixed with an app-wide global stacking override
-  on the shared overlay container, which silently reorders *every* overlay against *every* modal in
-  the application. Defensible, in scope, and exactly the kind of decision the owner should make
-  consciously rather than discover later.
+**The reviewer is read-only.** State it three ways: do not edit, do not create, do not stage or
+commit; findings in the reply only. Also prohibit build/typecheck/format-write commands and any
+other command with shared-tree side effects. Keep the reviewed tree frozen until every reviewer
+has produced its dispatch-specific completion token.
 
-**Ask the implementer to self-audit against the documents too**, before it reports: enumerate the
-governing sections and acceptance criteria and state, for each, whether the implementation
-satisfies it and where — *including requirements your brief never mentioned*. In practice this
-surfaces gaps the agent would otherwise leave silent, and it costs one paragraph of brief.
+**Brief from requirements, not your findings alone.** Supply authority documents, acceptance
+criteria and invariants, and ask what nothing implements *and* nothing records as deferred.
+Provide already-found items so the reviewer does not duplicate them, but ask it to challenge any
+that do not hold. Tell it to **report conflicts, not resolve them**: choosing between disagreeing
+documents is a scope decision, not a hidden implementation detail.
 
-**Why this is worth the extra pass.** Observed here across five rounds on one specification-heavy
-task: every round, an independent review found P1 defects that brief-based verification had passed
-— a rejection flow rolled back by its own rejection, one party acting as author, approver and
-reviewer on a matter requiring independence, a derived record that silently omitted relationships
-it was supposed to govern. Each had a green full gate over it. A passing suite is evidence about
-the tests, not about the requirements.
+**Angles worth adding to every brief:**
+
+- **New suppressions and whether their justification is true.** Inspect `eslint-disable`,
+  `@ts-ignore`, `@ts-expect-error`, `.skip`, `xit`, and lint-config exemptions. Check whether a
+  claimed existing constraint actually predates this task. A constraint introduced by the same
+  change is not independent justification for suppressing a rule.
+- **Blast radius versus stated scope.** Flag global styles, shared config, base classes and
+  dependency-injection providers whose reach exceeds the task, even if they fix the local symptom.
+  Broader consequences need an explicit decision rather than silent acceptance.
+- **For "build X like existing Y", diff every new file against its source and explain deletions.**
+  A new file can look complete while omitting behavior or styling the cloned code still needs.
+  Give reviewers the file pairs explicitly and ask whether anything still depends on each removed
+  line. Reading only additions does not establish parity.
+
+**Ask the implementer to self-audit against the documents too**, before reporting: enumerate
+sections and acceptance criteria and say whether each is satisfied and where, including requirements
+not repeated in the brief. This complements, rather than replaces, independent review.
+
+A passing suite is evidence about what the tests establish, not proof of every requirement.
 
 ## Reviewing a fix round
 
-**Every fix round gets the same review the implementation got.** Not a lighter one. This is the
-step most likely to be skipped, because by round 2 or 3 the file has already been read by three
-people, the diff is small, and the mental model says "it's correct now, we're just closing
-findings". That model is wrong, and the evidence is direct: on one task a round-3 fix sweeping a
-whole permissions matrix flattened a distinction the source document draws — one role's *denied*
-action became indistinguishable from two roles' *allowed* action — and the exhaustive oracle
-passed, because the expected value had been updated alongside the implementation. Nobody had been
-asked to review the fix. It was caught by chance.
+**Every fix round gets the same review the implementation got.** A small diff in already-reviewed
+files is still new code. Fixes optimize for the instruction they received, often when attention is
+lowest, and may change the tests or expected values that previously served as independent checks.
 
-A fix round is *more* dangerous than the original, for three reasons: it is written under
-instruction rather than from the requirements, so the agent optimizes for satisfying the finding;
-it touches code every reviewer has already blessed, so attention is lowest exactly where change is
-newest; and it frequently edits the **tests and expected values** that were the safety net for the
-code it is changing.
+Run the same reviewer fan-out, with these angles:
 
-So run the same fan-out, with these angles instead of the round-1 ones:
+- **Did the fix regress something previously correct?** Diff against the *pre-fix* state, not just
+  `HEAD`, and inspect everything else that moved. Sweeps, renames and shared-helper refactors have
+  broader risk than the reported symptom.
+- **Was an expected value, oracle, fixture or snapshot changed to match the implementation?**
+  Re-derive changed expectations from the document, schema or spec, never from the code diff.
+  Code and its oracle changing together deserve particular scrutiny.
+- **Did it fix the instance or the class?** Look for the same defect in siblings not named in the
+  finding, and check that the generalization introduces nothing the documents do not require.
+- **Is "done" actually done?** Check every fix-list item against the code, including items quietly
+  dropped or declared out of scope without approval.
+- **What did a deletion orphan?** Check unused exports, dead helpers, unreachable branches and
+  surviving protections whose tests disappeared in the refactor.
+- **Did you check the changed helper, or its callers?** Search every caller of changed shared
+  functions. A corrected helper cannot fix a feature if a caller still supplies the wrong shape
+  or an unnormalized value. Trace the behavior through its call sites, not only in isolation.
 
-- **Did the fix regress something that was previously correct?** Diff the fix against the
-  *pre-fix* state of the same files, not against HEAD, and ask what else moved. A fix with a wide
-  blast radius — a sweep, a rename, a refactor of a shared helper — is the high-risk shape.
-- **Was an expected value, oracle row, fixture or snapshot edited to match the new implementation
-  rather than the source of truth?** This is the signature failure of a fix round, and it converts
-  a test into a mirror. Re-derive the changed expectation from the document, schema or spec — never
-  from the diff. If an oracle row and the code changed in the same commit, that row is suspect by
-  default.
-- **Did it fix the instance or the class?** The finding named one symptom. Ask whether the same
-  defect exists in the siblings the finding did not name, and whether the fix's own generalization
-  (if it made one) introduced anything the documents do not require.
-- **Is "done" actually done?** Check each item of the fix list against the code, not against the
-  agent's report of it. Items quietly dropped, or marked out-of-scope without saying so, are common.
-- **What did a deletion orphan?** Subtractive rounds leave unused exports, dead helpers, unreachable
-  branches — and, worse, protections that survived the refactor but lost the test that covered them.
+**Write fix instructions so they cannot be satisfied in a broken way.** When an invariant requires
+one authoritative normalization point, mandate where it must hold rather than offering a menu of
+per-call-site workarounds. A choice between a complete fix and a weaker local check authorizes the
+weaker option. Name the invariant and its source of truth; ask the user if choosing it changes scope.
 
-Give the reviewers the list of findings the round was supposed to close, and ask them to verify each
-was actually closed *and* to look for what the fix broke. Tell them explicitly that the fix is the
-subject under review, not the original implementation — otherwise they re-review the whole change
-and re-report round-1 findings.
+Give reviewers the findings the round should close and ask both whether each closed and what the
+fix broke. Make clear that this round's fix is the subject, not a duplicate review of the original
+implementation. Supply the pre-fix comparison and the governing requirements.
 
-**The round budget does not govern this.** Reviewing a fix is not a fourth round; it is the second
-half of the round that produced the fix. If that review finds a fresh defect, see the cycle rule
-under Step 3.
+**The round budget does not waive fix review.** Reviewing a fix is the second half of the round
+that produced it, not a fourth round. Fresh defects follow the cycle rule under Step 3.
 
 ## Default workflow
 
 ### Step 0 — Parse and validate target
 
-1. Parse the target(s) and the prompt text from the invocation line. With `codex-pane=`/`zcoder-pane=` both present, apply **Routing** now and state the choice in one line.
-2. `herdr agent get <pane>` — confirm it resolves; note `agent`, `agent_status`, `cwd`. If it does not resolve or reports `agent_status: unknown`, fall back to `herdr pane get`/`herdr pane list` and use **Driving a pane with no herdr integration**. zcode reports normally here now, so a zcode pane goes down the ordinary `herdr agent prompt`/`herdr agent wait` path — do not send it to the fallback out of habit.
-3. If `agent_status` isn't `idle`, tell the user and ask whether to proceed anyway, wait, or pick a different pane.
-4. If `cwd` doesn't match the repo you're operating in, confirm with the user before proceeding.
-5. If unsure whether this agent's herdr integration is current, `herdr integration status` and check the row matching the `agent` name from step 2.
-6. **Read the repo's own agent instructions before writing the brief** — `AGENTS.md`, `CLAUDE.md`,
-   `.cursorrules`, or whatever the repo carries. Shared monorepos routinely restrict agents to a
-   subset of projects, forbid staging or committing, or ban whole directories, and the pane's agent
-   *will* read them and stop. Observed here: a brief required edits in two libraries that
-   `AGENTS.md` placed off-limits; the implementer refused and asked for authorization, costing a
-   full round trip and a round of owner decisions — and the driving context had already violated the
-   same rule by writing a file into one of those libraries while planning. Check the constraints
-   first, and where the task genuinely needs an exception, get the owner's authorization *before*
-   dispatching rather than after the agent blocks on it.
+1. Parse the targets and prompt. Resolve bare pane IDs, reject this session's own pane, and state
+   the resolved targets. With multiple candidates, apply **Routing** and explain the choice in one
+   line; an explicit `pane=` takes precedence.
+2. Run `herdr agent get <pane>` for each participant and note `agent`, `agent_status` and `cwd`.
+   If semantic registration is unavailable, use `herdr pane get` / `herdr pane list` and the
+   hookless workflow above. An active zcode hook uses the ordinary semantic path, not the fallback
+   merely because of the agent's name.
+3. If a participant is busy or blocked, ask whether to wait, proceed with authorization, or pick
+   another pane. Unknown state requires inspecting the pane and confirming readiness, not blindly
+   sending text. Resolve directory mismatches before dispatch.
+4. Check `herdr integration status` when uncertain about hook currency, with the zcode exception
+   described above. Re-check registration immediately before each dispatch.
+5. **Read the repository's own instructions before writing the brief**: `AGENTS.md`, `CLAUDE.md`,
+   `.cursorrules`, and applicable directory-specific rules. Check allowed paths, gate commands,
+   staging/commit restrictions and prohibited directories. Obtain any needed scope exception from
+   the user before dispatch; a brief cannot silently override repository restrictions.
+6. Record existing tracked, staged and untracked changes so unrelated work is not attributed to
+   this task. Preserve a pre-round comparison for subsequent fix review without staging or committing.
 
 ### Step 1 — Submit task (round N, starts at 1)
 
-1. Compose the exact text to send:
-   - **Round 1**: the user's task, restated with concrete acceptance criteria. If the request is materially ambiguous, ask the user before dispatching — don't let the agent guess at scope.
-   - **Round 2/3**: only the specific review findings from the previous round, phrased as an exact fix instruction referencing files/lines. Don't re-send the whole original task.
-   - **Requirements that change mid-round: amend immediately, don't wait for the round to end.**
-     When the owner redefines the target while the agent is working, send an amendment the moment
-     you have it — the agent is otherwise busy implementing something you already know is wrong.
-     Write it to a file like any other brief, name exactly which sections and item numbers it
-     overrides, and state that everything unmentioned still stands; then send one line pointing at
-     it. Observed here: three amendments landed mid-round and the agent picked them up cleanly, one
-     of them arriving just before it would have implemented a fix the owner had superseded.
-     Amendments do not consume a round — the round-3 cap governs looping on findings, not owner
-     re-scoping. Do re-verify afterwards that the amendments actually landed, since a mid-round
-     redefinition invalidates any review you did of the earlier state.
-2. Submit without blocking: `herdr agent prompt <pane> "<text>"` (no `--wait` — we control the wait ourselves for better state handling).
-3. Wait for it to settle without blocking your own turn — run as a background Bash command:
-   `herdr agent wait <pane> --until idle --until done --until blocked`
-   with `run_in_background: true`. You'll get a completion notification when it returns; don't poll `herdr agent get` in a loop.
-4. When notified, branch on the resulting state:
-   - **`blocked`** — the agent needs input (a permission prompt, a clarifying question). Read its output with `herdr agent read <pane> --lines 200`, surface it to the user, and stop the loop here. This isn't a "fix" round; it needs a human (or you, on the user's behalf) to unblock the pane directly.
-   - **`idle` / `done`** — **check the completion token before believing it.** `agent_status` tracks
-     the TUI, not the work: an agent that stops to ask a question, or pauses between phases, reports
-     `idle`/`done` too. The token you asked for in the brief is the only signal the agent itself
-     emitted on finishing. Observed here: a round-2 wait returned `done` with the token absent — the
-     agent was sitting on a permission prompt, mid-task. Another returned `done` with an unchanged
-     working tree because the agent had stopped on a scope conflict. `grep -c '<TOKEN>'` over
-     `herdr agent read`, and if it is absent treat the state as suspect and read the pane before
-     proceeding to Step 2.
-   - **the wait died without a completion token** — your session was resumed, the machine rebooted,
-     the task was killed, or the pane's agent exited mid-run. Never read this as "the agent finished"
-     or as "the agent did nothing". Check three things before deciding: `herdr pane read <pane>` (a
-     shell prompt means the agent is gone, not idle), `git status` for partial work, and whether the
-     completion token was ever printed. Then **restart with a continuation brief** rather than
-     resending the original: state what is already on disk, what is still missing, and that the
-     partial work is the agent's own unreviewed output to re-check rather than to trust. A fresh
-     session has none of the prior context, so an unqualified "carry on" makes it guess.
+1. Compose the exact brief:
+   - **Round 1:** restate the user's task with concrete acceptance criteria, governing sources,
+     constraints, allowed paths, evidence requirements and the dispatch-specific completion token.
+     Ask first if scope is materially ambiguous.
+   - **A mockup or reference screenshot is acceptance evidence, not decoration.** Do not recommend
+     dropping or changing a depicted feature just because implementation or backing data is awkward.
+     Ask for the written requirement and identify any proposed change as a deviation needing the
+     user's approval. Reconcile conflicting sources rather than quietly choosing the easier one.
+   - **Rounds 2/3:** send only the verified findings and exact fix instructions with files/lines and
+     governing source quotations. Do not resend the entire task. Preserve applicable constraints
+     and request a fresh completion token and evidence report.
+   - **Requirements changing mid-round need an immediate amendment.** Write a separate brief naming
+     the sections/items it overrides and stating that everything else stands. Use the harness's
+     supported queued input; do not interrupt or inject text into a permission dialog. Confirm
+     receipt or ask the user if safe delivery is unavailable. Amendments do not consume a review
+     round, but invalidate reviews of the superseded state; verify the amendment actually landed.
+2. Submit without blocking: `herdr agent prompt <pane> "<text>"`, without `--wait`, so state handling
+   remains under your control. For a long brief, send only the one-line instruction to read it.
+   If registration fails, inspect for a potentially accepted prompt before using the hookless path.
+3. Wait with `herdr agent wait <pane> --until idle --until done --until blocked`. Use the harness's
+   background-job facility, such as `run_in_background: true` where supported, and its completion
+   notification rather than polling `herdr agent get`.
+   **Fold token verification into the wait job when possible**: preserve the wait result and exit
+   status, then capture the pane output and test for the exact standalone token from this dispatch.
+   Report state and token presence separately; a later successful read must not mask a failed wait.
+   Use the visible source for blocked panes. Do not use an unanchored substring count that can match
+   the echoed brief. If the harness has no background facility, use a bounded wait and inspect its
+   result instead of pretending a notification will arrive.
+   The user may see an idle pane before your notification arrives. Say which verification remains
+   rather than restarting checks merely because they say it looks finished.
+4. Branch on the result:
+   - **`blocked`:** read `herdr agent read <pane> --lines 200 --source visible`, surface the actual
+     request, and pause the loop. Clarifications and approvals do not consume a fix round. Apply
+     the permission guardrail: only an exact explicitly preauthorized action may be approved on
+     the user's behalf; otherwise the human decides.
+   - **`idle` / `done`:** require the unique token as the final standalone report line before Step 2.
+     State tracks the TUI, not necessarily completion: a question, phase pause or permission prompt
+     may also look idle. If the token is absent, read enough output to find why; do not treat a
+     truncated capture, an old token or an unchanged tree as a verdict. Reconcile the token with
+     the actual report and state; a blocked request remains blocked even if a token appears.
+   - **Wait terminated without completion evidence:** inspect `herdr pane read <pane>`, partial work
+     in `git status`, and whether the current token was printed. A shell prompt means the agent is
+     gone, not finished. Once restart is authorized, send a **continuation brief**, not the original
+     task: name what is on disk, what is missing, and that partial output is unreviewed and must be
+     re-checked. A fresh session does not know what "carry on" means.
 
 ### Step 2 — Review the result (in the current context)
 
-1. `herdr agent read <pane> --lines 200` to see what the agent reported it did — treat this as a claim, not a verdict.
-2. Apply the **Verification contract** above — a clean-state gate run, interface shapes checked
-   against the other side, new tests mutation-checked, existing tests confirmed not weakened.
-   Then review the actual working-tree change yourself, right here: `git -C <cwd> diff` / `git -C <cwd> status --short`, and `Read` any changed file where the diff alone doesn't give enough context (e.g. to check surrounding logic or a moved block). Don't spawn a subagent for this — you already hold the task's scope and acceptance criteria from Step 1, so re-deriving that context in a fresh agent every round is pure overhead.
-3. On specification-governed or expensive-to-get-wrong work, dispatch **both** non-implementing
-   agents as read-only reviewers now, each with its own angle (see **Cross-agent review** above),
-   and read their findings alongside your own. Run them concurrently with each other; run your own
-   *reading* review in parallel too, but save the clean-state gate until they report, so nothing
-   writes to the tree while they work. Do not skip the reviewers because your own review came back
-   clean; that is precisely the case where they pay. Merge and de-duplicate their findings, verify
-   each yourself, and carry one consolidated list into Step 3.
-4. **Do this again after every fix round, not only after round 1.** A fix round is reviewed the
-   same way the implementation was — see **Reviewing a fix round** above. Skipping it because the
-   diff is small is how a regression ships.
-5. Judge it against this standard:
-   - Did the change satisfy this round's scope?
-   - Any correctness or regression risk?
-   - Tests missing or insufficient?
-   - Unnecessary complexity introduced?
-   - Anything still ambiguous or unsafe to merge?
+1. Read the implementer's report with `herdr agent read <pane> --lines 200`, expanding as needed.
+   Treat it as a claim, not the verdict. Confirm completion before starting review.
+2. Review the actual change here: `git -C <cwd> diff`, `git -C <cwd> diff --cached`,
+   `git -C <cwd> status --short`, and `Read` for changed or untracked files and surrounding context.
+   Compare with the recorded baseline so existing user changes are not mistaken for task output.
+   Do not spawn a subagent to replace your own review; you already hold the scope and criteria.
+3. For specification-governed or expensive-to-get-wrong work, dispatch the available named
+   non-implementers as read-only reviewers, each with a different angle. Use both when both were
+   supplied. Run your own reading review concurrently, but freeze writes and reserve the full gate
+   until **every** reviewer has returned its unique completion token. Do not skip them just because
+   your own reading found nothing. With no independent pane, disclose that limitation.
+4. Apply the **Verification contract**: validate source citations, interface shapes, derived values,
+   coverage, fake behavior and test strength. Run isolated mutation/runtime checks where applicable,
+   then the authoritative clean-state gate alone on the final unchanged tree. Merge and de-duplicate
+   findings, verify each one, and carry one consolidated list into Step 3.
+5. **Repeat after every fix round**, using the pre-fix state and fix-review angles, not a lighter
+   check because the diff is small. Judge whether the change satisfies this round's scope, risks
+   regressions, lacks meaningful tests, adds unnecessary complexity, or remains ambiguous or unsafe
+   to accept. Unavailable checks stay explicit caveats, not implied passes.
 
 ### Step 3 — Decide
 
-- **Clean** (no concrete issues) → approve, summarize changed files + validation, done.
-- **Concrete issues, rounds used < 3** → go back to Step 1 with an exact fix instruction covering only the findings (round += 1). When that fix lands, review it — **Reviewing a fix round** above is not optional and not lighter than the first review.
-- **Concrete issues, this was round 3** → stop looping. Fix the remaining issues yourself directly with Edit/Write, then re-run whatever validation/tests are affected. Tell the user the pane's agent needed a manual finish after 3 rounds and summarize exactly what you changed and why. **Your own fix gets reviewed too** — you are now the implementer, so the same rule applies: you are the last person who should be trusted to judge it, and the non-implementing panes are still available and still read-only.
-- **Findings require a product/scope decision** → stop and ask the user, regardless of round count.
+- **Clean, with acceptance evidence satisfied:** approve the reviewed work, summarize changed files
+  and validation, and proceed to Step 4. Approval does not authorize a commit or push.
+- **Concrete issues, rounds used < 3:** return to Step 1 with the consolidated exact fix instruction
+  (`round += 1`). Review the resulting fix with the same rigor as the original change.
+- **Concrete issues after round 3:** stop looping on those findings. Once implementer and reviewers
+  are finished, take sole-writer ownership and fix remaining in-scope issues with Edit/Write.
+  Tell the user which issues required a manual finish and why. **Your fix gets independent review
+  too** from non-authors, followed by the affected checks and clean-state gate.
+- **Any driving-context edit gets that review, not only a round-3 finish.** A fix responding to the
+  owner's review, a measured threshold adjustment or a documentation correction is still new work.
+  Brief reviewers from the requirement and decision text, not your account of how you fixed it.
+  The original implementer may review this later change because it did not author it.
+- **After the loop, small driving-context fixes may be batched, not waived.** Keep a running list
+  of owner/PR feedback and the resulting fixes. Mutation-check behavior changes where applicable
+  and use appropriate checks for visual or prose changes. Before handoff for a push, send the batch
+  to a non-author pane as one read-only review, using the original comments as its brief, then run
+  the clean-state gate once. Individual probes cannot establish that fixes interact correctly.
+  If no independent pane is available, ask for one and disclose the review gap rather than silently
+  claiming independent approval.
+- **Product or scope decision:** stop and ask the user, regardless of round count.
 
-The 3-round cap governs *looping on the same findings*. Fresh defects from a cross-agent review or
-an owner review start a new cycle rather than exhausting the budget — but if each cycle keeps
-finding P1s, say so plainly to the user rather than quietly continuing; that pattern is evidence
-about the brief or the review method, not just about the code.
+The three-round cap governs **looping on the same findings**. A genuinely fresh defect from a
+cross-agent or owner review starts a new cycle, not an excuse to relabel an unresolved finding.
+Do not quietly continue through repeated cycles of serious defects: tell the user, identify the
+brief or review gap, and agree the next step and any budget limits.
 
-**Rising severity across cycles is a signal about the reviews, not the code.** If round 1 and 2 find
-only P2s and a later reviewer finds P1s, the code did not get worse between rounds — the earlier
-reviews shared a frame that could not see that class of defect. Say so, and name the frame, rather
-than reporting it as the implementer regressing.
+**Rising severity across cycles is a signal to examine the review method.** A later serious finding
+may expose an earlier shared blind spot rather than a regression. Check the pre-fix evidence before
+attributing its origin. Name the missed review angle — such as examining helpers in isolation
+without tracing their callers — instead of assuming the implementer made previously correct code worse.
 
-**Review the owner's own changes the same way.** When the user hands back edits and asks you to
-check them, the deference reflex is to read them as decisions rather than as a diff. Run the same
-verification: mutation-check the assertions they added, confirm their "stronger" test did not
-replace a catalog sweep with a hand-list, confirm no existing test was weakened. Being asked to
-review is being asked to actually review. Where their call overrode yours and theirs was better,
-say so plainly and say why — that is how the routing and decline heuristics here get corrected.
+### Step 4 — Hand off, then confirm the commit is what was reviewed
 
-## Example
+Everything above verifies the **working tree**. Partial staging, conflict resolution or applying
+changes to the wrong branch can make the eventual commit differ. A green gate on the tree does not
+prove the contents of a later commit.
 
-`/panel pane=w3:p4 Fix the flaky timeline test in apps/web/src/lib/timeline.spec.ts`
+- At approval, record the reviewed blob hash of **every added or modified file** using
+  `git hash-object --path="<path>" -- "<path>"`, without `-w`, so the hash reflects the file's
+  working-tree content with Git's applicable clean conversion. Record deletions explicitly and
+  include file modes and rename paths when relevant. An unresolved conflict blocks approval.
+  `git ls-files -s` shows the **index**, not unstaged reviewed content; use it only after confirming
+  the index and reviewed tree are identical, never as a substitute for hashing unstaged files.
+- Put this path/hash manifest in the handoff summary, alongside validation and any caveats. Include
+  a one-line check the owner can run: `git ls-tree -r HEAD -- <reviewed-paths>`, substituting the
+  actual safely quoted paths. Deleted paths should be absent. Account separately for symlinks or
+  submodules rather than hashing their targets as ordinary files.
+- When the owner says it is committed, or you next inspect the branch, compare that command's blob
+  hashes and modes with the manifest. If the reviewed commit is not `HEAD`, use its confirmed ID.
+  A mismatch is either an intended later edit needing review or work that did not make it into the
+  commit; identify which before claiming the commit is verified.
+- Never stage, commit or push to perform this comparison. If the eventual commit is unavailable,
+  hand off the check as pending rather than implying it has already passed. Matching blobs can
+  also demonstrate that a later repair faithfully restores the reviewed content.
 
-- Step 0: `herdr agent get w3:p4` → `codex`, idle, `cwd` matches the repo.
-- Round 1: submit task, wait in background, agent goes idle.
-- Review 1: `git diff` shows a missed edge case in the fix.
-- Round 2: submit the exact fix instruction, wait, agent goes idle.
-- Review 2: clean → approve, summarize files changed and validation run.
+**Review the owner's changes the same way when asked.** Mutation-check added assertions, including
+assertions added to existing tests: confirm they fail for the intended reason under a relevant
+isolated mutation. Preserve catalog-wide coverage rather than replacing it with hand-picked cases,
+and confirm existing tests were not weakened. Treat requested review as an actual diff review, not automatic deference to its
+author. If the owner's correction improves on your decision, explain why and update your judgment.
 
-The same flow works unchanged with `pane=` pointing at an `agy` (antigravity), `opencode`, `pi`, or `omp` pane instead — only the `agent` field reported by `herdr agent get` differs.
+## Examples
 
-Routed, with the reviewer fan-out:
+The following pane IDs and paths are generic examples; resolve the user's actual targets.
 
-`/panel codex-pane=p5 zcoder-pane=p4 agy-pane=p3 Implement TASK-42 per implementation-plan.md`
+`/panel pane=w3:p4 Fix the flaky sorting test in tests/sort.test.ts`
 
-- Step 0: resolve `p3`/`p4`/`p5` against `$HERDR_WORKSPACE_ID`; Routing picks **zcode** (spec
-  fidelity — fixtures derived from the data model, an invariant suite over decided constraints).
-  Say so in one line.
-- Round 1: brief zcode from the authority documents, wait in background.
-- Review 1: dispatch **codex** (adversarial: tenancy, grants, what breaks) and **agy** (leftovers,
-  interface claims, tests that cannot fail) concurrently as read-only reviewers, each told not to
-  run build/typecheck/format-write commands. Read the diff yourself meanwhile. When both report,
-  run the clean-state gate alone, merge and de-duplicate their findings, verify each.
-- Round 2: send zcode **one** consolidated fix instruction covering the surviving findings.
-- Review 2: review the **fix** — not the whole change again. Confirm each finding actually closed,
-  and hunt what the fix broke: re-derive from the spec any expected/oracle row the fix touched,
-  since a row edited in the same round as the code it guards has stopped being an independent
-  check. Fan the reviewers out again with those angles.
+- Step 0: `herdr agent get w3:p4` confirms an idle agent in the intended checkout.
+- Round 1: submit the brief with a unique token, wait, then verify state plus token.
+- Review 1: inspect the real diff and evidence; identify a missed edge case.
+- Round 2: send the exact fix instruction with a fresh token and wait for completion.
+- Review 2: review the fix and run validation; if clean, approve and record reviewed hashes.
+- Handoff: leave commits to the owner and later compare the committed blobs to the manifest.
+
+The same flow works with an `agy`, `opencode`, `pi`, `omp` or other pane; use its actual registration
+and the hookless fallback when necessary. No other delegation skill is required.
+
+Routed, with reviewer fan-out:
+
+`/panel codex-pane=p5 zcoder-pane=p4 agy-pane=p3 Implement the serializer per docs/spec.md`
+
+- Resolve targets against `$HERDR_WORKSPACE_ID`; choose zcode for specification fidelity and say why.
+- Round 1: brief it from the authority document, including concrete acceptance criteria and evidence.
+- Review 1: dispatch codex for correctness/failure paths and agy for interface claims and test
+  sensitivity. Both are read-only, with builds and other shared-tree writes forbidden. Read the
+  diff yourself. After both unique completion tokens arrive, verify and consolidate the findings
+  and run the clean-state gate alone.
+- Round 2: send one consolidated instruction to the same implementer.
+- Review 2: verify closure and look for regressions, tracing changed helpers through callers and
+  re-deriving changed expectations from the spec. Fan the reviewers out again on the fix.
+- Handoff: report acceptance evidence, caveats and reviewed hashes; compare the owner's later
+  commit without committing anything yourself.
