@@ -111,7 +111,8 @@ same reasoning, say when you lack evidence, and prefer an idle candidate when no
 An external, enumerable oracle makes this angle concrete: require file:line citations for option
 names, return contracts and acceptance-to-test mappings. Source checking does not substitute for
 walking a user flow. Assign runtime interaction review separately rather than treating an accurate
-contract checklist as proof that a screen is usable.
+contract checklist as proof that a screen is usable. Ask "is every one of these paths tested", not
+"is this usable".
 
 **Distinguish deciding a boundary from touching one.** Reserve the correctness/security preference
 for work that *decides* a security question; application code that merely consumes an established
@@ -133,7 +134,9 @@ different evidence. A weak self-report does not automatically invalidate a usefu
 
 **Severity calibration belongs in the brief.** Tell every reviewer to be conservative: a test
 thinner than its name is generally a test-quality finding, not automatically a production blocker.
-Ask for the user-visible consequence and re-derive severity rather than inheriting the label.
+Ask for the user-visible consequence and re-derive severity rather than inheriting the label. One
+sentence of calibration in the brief is more reliable than discounting afterwards, so state it in
+every reviewer brief rather than treating a miscalibrated grade as a fixed property of the agent.
 
 **Cautions for every pane, including opencode:**
 
@@ -163,9 +166,11 @@ Ask for the user-visible consequence and re-derive severity rather than inheriti
 - **Reviewers may read; they must not build.** State the off-limits commands explicitly. Builds,
   incremental typechecks and format-write commands can write generated output or caches; for
   example, `tsc -b` writes build output and `*.tsbuildinfo`. Do not assume a command is read-only
-  because it is called a check or a test. Permit check-mode linters, formatters or tests only after
-  confirming they do not modify the shared tree or collide on external resources. Unique test
-  databases alone do not establish that all outputs are isolated. **You** run the authoritative
+  because it is called a check or a test. Two reviewers running such commands against one checkout
+  clobber each other's incremental cache and produce *false* failures — worse than not running the
+  check at all, because you then debug a phantom. Permit check-mode linters, formatters or tests
+  only after confirming they do not modify the shared tree or collide on external resources. Unique
+  test databases alone do not establish that all outputs are isolated. **You** run the authoritative
   clean-state gate alone after the reviewers have reported.
 - **"Alone" includes the implementer and the next fix round.** Sequence it: implementer idle →
   reviewers complete → gate → read result → dispatch next round. Never overlap a gate with an
@@ -388,7 +393,9 @@ adding much coverage. Default angles:
 
 Every brief still carries the read-only rule, already-reported findings, and the instruction to
 report document conflicts rather than resolve them. Spend an additional dispatch on a new question,
-not just another reader answering the same question.
+not just another reader answering the same question. Where readers are given genuinely different
+angles, their findings tend to come back disjoint — each angle surfaces its own defect class — which
+is the reason to split rather than merely to add headcount.
 
 **Assign the angle to the brief, not the agent.** The pairings are defaults, not inherent expertise.
 When reviewers disagree, settle the finding with source evidence, a runtime check or an isolated
@@ -458,6 +465,15 @@ A passing suite is evidence about what the tests establish, not proof of every r
 **Every fix round gets the same review the implementation got.** A small diff in already-reviewed
 files is still new code. Fixes optimize for the instruction they received, often when attention is
 lowest, and may change the tests or expected values that previously served as independent checks.
+
+This is the review most likely to be skipped, because by round two or three the file has been read
+several times and the mental model says "we are only closing findings now". Treat a fix round as
+*more* dangerous than the original change, for three reasons: it is written to satisfy a finding
+rather than derived from the requirements; it lands in code every reviewer has already blessed, so
+attention is lowest exactly where the change is newest; and it frequently edits the tests and
+expected values that were the safety net for the code it is changing. A round that sweeps a matrix,
+renames an identifier or refactors a shared helper can flatten a distinction the source draws and
+still pass an exhaustive oracle, because the expected value moved with the implementation.
 
 Run the same reviewer fan-out, with these angles:
 
